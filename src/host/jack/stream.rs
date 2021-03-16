@@ -5,7 +5,7 @@ use traits::StreamTrait;
 
 use crate::{
     BackendSpecificError, Data, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleRate, StreamError,
+    PlayStreamError, SampleRate, StreamError, DuplexCallbackInfo
 };
 
 use super::JACK_SAMPLE_FORMAT;
@@ -30,40 +30,15 @@ impl Stream {
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let mut ports = vec![];
-        let mut port_names: Vec<String> = vec![];
-        // Create ports
-        for i in 0..channels {
-            let port_try = client.register_port(&format!("in_{}", i), jack::AudioIn::default());
-            match port_try {
-                Ok(port) => {
-                    // Get the port name in order to later connect it automatically
-                    if let Ok(port_name) = port.name() {
-                        port_names.push(port_name);
-                    }
-                    // Store the port into a Vec to move to the ProcessHandler
-                    ports.push(port);
-                }
-                Err(e) => {
-                    // If port creation failed, send the error back via the error_callback
-                    error_callback(
-                        BackendSpecificError {
-                            description: e.to_string(),
-                        }
-                        .into(),
-                    );
-                }
-            }
-        }
+        let (ports, port_names) = Self::create_input_ports(&client, channels, &mut error_callback);
 
         let playing = Arc::new(AtomicBool::new(true));
 
         let input_process_handler = LocalProcessHandler::new(
-            vec![],
             ports,
+            vec![],
             SampleRate(client.sample_rate() as u32),
-            Some(Box::new(data_callback)),
-            None,
+            LocalDataCallback::Input(Box::new(data_callback)),
             playing.clone(),
             client.buffer_size() as usize,
         );
@@ -92,10 +67,109 @@ impl Stream {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
+        let (ports, port_names) = Self::create_output_ports(&client, channels, &mut error_callback);
+
+        let playing = Arc::new(AtomicBool::new(true));
+
+        let output_process_handler = LocalProcessHandler::new(
+            vec![],
+            ports,
+            SampleRate(client.sample_rate() as u32),
+            LocalDataCallback::Output(Box::new(data_callback)),
+            playing.clone(),
+            client.buffer_size() as usize,
+        );
+
+        let notification_handler = JackNotificationHandler::new(error_callback);
+
+        let async_client = client
+            .activate_async(notification_handler, output_process_handler)
+            .unwrap();
+
+        Stream {
+            playing,
+            async_client,
+            input_port_names: vec![],
+            output_port_names: port_names,
+        }
+    }
+
+    pub fn new_duplex<D, E>(
+        client: jack::Client,
+        input_channels: ChannelCount,
+        output_channels: ChannelCount,
+        data_callback: D,
+        mut error_callback: E,
+    ) -> Stream
+    where
+        D: FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static,
+        E: FnMut(StreamError) + Send + 'static,
+    {
+        let (input_ports, input_port_names) = Self::create_input_ports(&client, input_channels, &mut error_callback);
+        let (output_ports, output_port_names) = Self::create_output_ports(&client, output_channels, &mut error_callback);
+
+        let playing = Arc::new(AtomicBool::new(true));
+
+        let output_process_handler = LocalProcessHandler::new(
+            input_ports,
+            output_ports,
+            SampleRate(client.sample_rate() as u32),
+            LocalDataCallback::Duplex(Box::new(data_callback)),
+            playing.clone(),
+            client.buffer_size() as usize,
+        );
+
+        let notification_handler = JackNotificationHandler::new(error_callback);
+
+        let async_client = client
+            .activate_async(notification_handler, output_process_handler)
+            .unwrap();
+
+        Stream {
+            playing,
+            async_client,
+            input_port_names,
+            output_port_names,
+        }
+    }
+
+    fn create_input_ports<E>(client: &jack::Client, amount: ChannelCount, error_callback: &mut E) -> (Vec<jack::Port<jack::AudioIn>>, Vec<String>)
+    where E: FnMut(StreamError) + Send + 'static,
+    {
+        let mut ports = vec![];
+        let mut port_names: Vec<String> = vec![];
+        for i in 0..amount {
+            let port_try = client.register_port(&format!("in_{}", i), jack::AudioIn::default());
+            match port_try {
+                Ok(port) => {
+                    // Get the port name in order to later connect it automatically
+                    if let Ok(port_name) = port.name() {
+                        port_names.push(port_name);
+                    }
+                    // Store the port into a Vec to move to the ProcessHandler
+                    ports.push(port);
+                }
+                Err(e) => {
+                    // If port creation failed, send the error back via the error_callback
+                    error_callback(
+                        BackendSpecificError {
+                            description: e.to_string(),
+                        }
+                        .into(),
+                    );
+                }
+            }
+        }
+        (ports, port_names)
+    }
+
+    fn create_output_ports<E>(client: &jack::Client, amount: ChannelCount, error_callback: &mut E) -> (Vec<jack::Port<jack::AudioOut>>, Vec<String>)
+    where E: FnMut(StreamError) + Send + 'static,
+    {
         let mut ports = vec![];
         let mut port_names: Vec<String> = vec![];
         // Create ports
-        for i in 0..channels {
+        for i in 0..amount {
             let port_try = client.register_port(&format!("out_{}", i), jack::AudioOut::default());
             match port_try {
                 Ok(port) => {
@@ -117,31 +191,7 @@ impl Stream {
                 }
             }
         }
-
-        let playing = Arc::new(AtomicBool::new(true));
-
-        let output_process_handler = LocalProcessHandler::new(
-            ports,
-            vec![],
-            SampleRate(client.sample_rate() as u32),
-            None,
-            Some(Box::new(data_callback)),
-            playing.clone(),
-            client.buffer_size() as usize,
-        );
-
-        let notification_handler = JackNotificationHandler::new(error_callback);
-
-        let async_client = client
-            .activate_async(notification_handler, output_process_handler)
-            .unwrap();
-
-        Stream {
-            playing,
-            async_client,
-            input_port_names: vec![],
-            output_port_names: port_names,
-        }
+        (ports, port_names)
     }
 
     /// Connect to the standard system outputs in jack, system:playback_1 and system:playback_2
@@ -211,12 +261,11 @@ impl StreamTrait for Stream {
 
 struct LocalProcessHandler {
     /// No new ports are allowed to be created after the creation of the LocalProcessHandler as that would invalidate the buffer sizes
-    out_ports: Vec<jack::Port<jack::AudioOut>>,
     in_ports: Vec<jack::Port<jack::AudioIn>>,
+    out_ports: Vec<jack::Port<jack::AudioOut>>,
 
     sample_rate: SampleRate,
-    input_data_callback: Option<Box<dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static>>,
-    output_data_callback: Option<Box<dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static>>,
+    callback: LocalDataCallback,
 
     temp_input_buffer: Vec<f32>,
 
@@ -229,15 +278,18 @@ struct LocalProcessHandler {
     creation_timestamp: std::time::Instant,
 }
 
+enum LocalDataCallback {
+    Input(Box<dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static>),
+    Output(Box<dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static>),
+    Duplex(Box<dyn FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static>),
+}
+
 impl LocalProcessHandler {
     fn new(
-        out_ports: Vec<jack::Port<jack::AudioOut>>,
         in_ports: Vec<jack::Port<jack::AudioIn>>,
+        out_ports: Vec<jack::Port<jack::AudioOut>>,
         sample_rate: SampleRate,
-        input_data_callback: Option<Box<dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static>>,
-        output_data_callback: Option<
-            Box<dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static>,
-        >,
+        callback: LocalDataCallback,
         playing: Arc<AtomicBool>,
         buffer_size: usize,
     ) -> Self {
@@ -251,13 +303,12 @@ impl LocalProcessHandler {
         // let in_port_buffers = Vec::with_capacity(in_ports.len());
 
         LocalProcessHandler {
-            out_ports,
             in_ports,
+            out_ports,
             // out_port_buffers,
             // in_port_buffers,
             sample_rate,
-            input_data_callback,
-            output_data_callback,
+            callback,
             temp_input_buffer,
             temp_output_buffer,
             temp_output_buffer_size_in_frames: buffer_size,
@@ -271,6 +322,14 @@ impl LocalProcessHandler {
 fn temp_output_buffer_to_data(temp_output_buffer: &mut Vec<f32>) -> Data {
     let data = temp_output_buffer.as_mut_ptr() as *mut ();
     let len = temp_output_buffer.len();
+    let data = unsafe { Data::from_parts(data, len, JACK_SAMPLE_FORMAT) };
+    data
+}
+
+fn temp_output_buffer_to_data_prefix(temp_output_buffer: &mut Vec<f32>, total_buffer_size: usize) -> Data {
+    let slice = &temp_output_buffer[0..total_buffer_size];
+    let data = slice.as_ptr() as *mut ();
+    let len = total_buffer_size;
     let data = unsafe { Data::from_parts(data, len, JACK_SAMPLE_FORMAT) };
     data
 }
@@ -311,80 +370,128 @@ impl jack::ProcessHandler for LocalProcessHandler {
             ))
             .expect("`playback` occurs beyond representation supported by `StreamInstant`");
 
-        if let Some(input_callback) = &mut self.input_data_callback {
-            // Let's get the data from the input ports and run the callback
+        match &mut self.callback {
+            LocalDataCallback::Input(input_callback) => {
+                // Let's get the data from the input ports and run the callback
 
-            let num_in_channels = self.in_ports.len();
+                let num_in_channels = self.in_ports.len();
 
-            // Read the data from the input ports into the temporary buffer
-            // Go through every channel and store its data in the temporary input buffer
-            for ch_ix in 0..num_in_channels {
-                let input_channel = &self.in_ports[ch_ix].as_slice(process_scope);
-                for i in 0..current_frame_count {
-                    self.temp_input_buffer[ch_ix + i * num_in_channels] = input_channel[i];
+                // Read the data from the input ports into the temporary buffer
+                // Go through every channel and store its data in the temporary input buffer
+                for ch_ix in 0..num_in_channels {
+                    let input_channel = &self.in_ports[ch_ix].as_slice(process_scope);
+                    for i in 0..current_frame_count {
+                        self.temp_input_buffer[ch_ix + i * num_in_channels] = input_channel[i];
+                    }
                 }
-            }
-            // Create a slice of exactly current_frame_count frames
-            let data = temp_input_buffer_to_data(
-                &mut self.temp_input_buffer,
-                current_frame_count * num_in_channels,
-            );
-            // Create timestamp
-            let frames_since_cycle_start = process_scope.frames_since_cycle_start() as usize;
-            let duration_since_cycle_start =
-                frames_to_duration(frames_since_cycle_start, self.sample_rate);
-            let callback = start_callback_instant
-                .add(duration_since_cycle_start)
-                .expect("`playback` occurs beyond representation supported by `StreamInstant`");
-            let capture = start_callback_instant;
-            let timestamp = crate::InputStreamTimestamp { callback, capture };
-            let info = crate::InputCallbackInfo { timestamp };
-            input_callback(&data, &info);
-        }
+                // Create a slice of exactly current_frame_count frames
+                let data = temp_input_buffer_to_data(
+                    &mut self.temp_input_buffer,
+                    current_frame_count * num_in_channels,
+                );
+                // Create timestamp
+                let frames_since_cycle_start = process_scope.frames_since_cycle_start() as usize;
+                let duration_since_cycle_start =
+                    frames_to_duration(frames_since_cycle_start, self.sample_rate);
+                let callback = start_callback_instant
+                    .add(duration_since_cycle_start)
+                    .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+                let capture = start_callback_instant;
+                let timestamp = crate::InputStreamTimestamp { callback, capture };
+                let info = crate::InputCallbackInfo { timestamp };
+                input_callback(&data, &info);
+            },
+            LocalDataCallback::Output(output_callback) => {
+                let num_out_channels = self.out_ports.len();
 
-        if let Some(output_callback) = &mut self.output_data_callback {
-            let num_out_channels = self.out_ports.len();
-
-            // Run the output callback on the temporary output buffer until we have filled the output ports
-            // JACK ports each provide a mutable slice to be filled with samples whereas CPAL uses interleaved
-            // channels. The formats therefore have to be bridged.
-            for i in 0..current_frame_count {
-                // Check if we have gotten all of the frames from the temp_output_buffer
-                if self.temp_output_buffer_frames_index == self.temp_output_buffer_size_in_frames {
-                    // Get new samples if the temporary buffer is depleted. This can theoretically happen
-                    // several times per cycle or once every few cycles if the buffer size changes, but in practice
-                    // it should generally happen once per cycle if the buffer size is not changed.
-                    let mut data = temp_output_buffer_to_data(&mut self.temp_output_buffer);
-                    // Create timestamp
-                    let frames_since_cycle_start =
-                        process_scope.frames_since_cycle_start() as usize;
-                    let duration_since_cycle_start =
-                        frames_to_duration(frames_since_cycle_start, self.sample_rate);
-                    let callback = start_callback_instant
-                        .add(duration_since_cycle_start)
-                        .expect(
+                // Run the output callback on the temporary output buffer until we have filled the output ports
+                // JACK ports each provide a mutable slice to be filled with samples whereas CPAL uses interleaved
+                // channels. The formats therefore have to be bridged.
+                for i in 0..current_frame_count {
+                    // Check if we have gotten all of the frames from the temp_output_buffer
+                    if self.temp_output_buffer_frames_index == self.temp_output_buffer_size_in_frames {
+                        // Get new samples if the temporary buffer is depleted. This can theoretically happen
+                        // several times per cycle or once every few cycles if the buffer size changes, but in practice
+                        // it should generally happen once per cycle if the buffer size is not changed.
+                        let mut data = temp_output_buffer_to_data(&mut self.temp_output_buffer);
+                        // Create timestamp
+                        let frames_since_cycle_start =
+                            process_scope.frames_since_cycle_start() as usize;
+                        let duration_since_cycle_start =
+                            frames_to_duration(frames_since_cycle_start, self.sample_rate);
+                        let callback = start_callback_instant
+                            .add(duration_since_cycle_start)
+                            .expect(
+                                "`playback` occurs beyond representation supported by `StreamInstant`",
+                            );
+                        let buffer_duration = frames_to_duration(current_frame_count, self.sample_rate);
+                        let playback = start_cycle_instant.add(buffer_duration).expect(
                             "`playback` occurs beyond representation supported by `StreamInstant`",
                         );
-                    let buffer_duration = frames_to_duration(current_frame_count, self.sample_rate);
-                    let playback = start_cycle_instant.add(buffer_duration).expect(
-                        "`playback` occurs beyond representation supported by `StreamInstant`",
-                    );
-                    let timestamp = crate::OutputStreamTimestamp { callback, playback };
-                    let info = crate::OutputCallbackInfo { timestamp };
-                    output_callback(&mut data, &info);
-                    self.temp_output_buffer_frames_index = 0;
+                        let timestamp = crate::OutputStreamTimestamp { callback, playback };
+                        let info = crate::OutputCallbackInfo { timestamp };
+                        output_callback(&mut data, &info);
+                        self.temp_output_buffer_frames_index = 0;
+                    }
+                    // Write the interleaved samples e.g. [l0, r0, l1, r1, ..] to each output buffer
+                    for ch_ix in 0..num_out_channels {
+                        // TODO: It should be marginally faster to store pointers to these slices, but I don't know how
+                        // to avoid lifetime issues and allocation
+                        let output_channel = &mut self.out_ports[ch_ix].as_mut_slice(process_scope);
+                        output_channel[i] = self.temp_output_buffer
+                            [ch_ix + self.temp_output_buffer_frames_index * num_out_channels];
+                    }
+                    // Count the number of frames that have been read from the temp buffer
+                    self.temp_output_buffer_frames_index += 1;
                 }
-                // Write the interleaved samples e.g. [l0, r0, l1, r1, ..] to each output buffer
+            },
+            LocalDataCallback::Duplex(duplex_callback) => {
+                // XXX: For now, mirroring the behaviour of the input mode regarding
+                // the temporary buffers. However, I think the temp buffers should be reallocated
+                // as necessary. See https://github.com/RustAudio/rust-jack/issues/137
+                let num_in_channels = self.in_ports.len();
+                let num_out_channels = self.out_ports.len();
+
+                // Read the data from the input ports into the temporary buffer
+                // Go through every channel and store its data in the temporary input buffer
+                for ch_ix in 0..num_in_channels {
+                    let input_channel = &self.in_ports[ch_ix].as_slice(process_scope);
+                    for i in 0..current_frame_count {
+                        self.temp_input_buffer[ch_ix + i * num_in_channels] = input_channel[i];
+                    }
+                }
+                // Create a slice of exactly current_frame_count frames for both input and output
+                let input_data = temp_input_buffer_to_data(
+                    &mut self.temp_input_buffer,
+                    current_frame_count * num_in_channels,
+                );
+
+                let mut output_data = temp_output_buffer_to_data_prefix(
+                    &mut self.temp_output_buffer,
+                    current_frame_count * num_out_channels
+                );
+
+                // Create timestamp
+                let frames_since_cycle_start = process_scope.frames_since_cycle_start() as usize;
+                let duration_since_cycle_start =
+                    frames_to_duration(frames_since_cycle_start, self.sample_rate);
+                let callback = start_callback_instant
+                    .add(duration_since_cycle_start)
+                    .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+                let capture = start_callback_instant;
+                // TODO: Think this through better. What is the most relevant info we can give? How
+                // about latencies?
+                let timestamp = crate::DuplexStreamTimestamp { callback, capture, playback: capture };
+                let info = crate::DuplexCallbackInfo { timestamp };
+                duplex_callback(&input_data, &mut output_data, &info);
+
                 for ch_ix in 0..num_out_channels {
-                    // TODO: It should be marginally faster to store pointers to these slices, but I don't know how
-                    // to avoid lifetime issues and allocation
                     let output_channel = &mut self.out_ports[ch_ix].as_mut_slice(process_scope);
-                    output_channel[i] = self.temp_output_buffer
-                        [ch_ix + self.temp_output_buffer_frames_index * num_out_channels];
+                    for i in 0..current_frame_count {
+                        output_channel[i] = self.temp_output_buffer[ch_ix + i * num_out_channels];
+                    }
                 }
-                // Count the number of frames that have been read from the temp buffer
-                self.temp_output_buffer_frames_index += 1;
-            }
+            },
         }
 
         // Continue as normal
